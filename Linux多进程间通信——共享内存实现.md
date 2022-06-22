@@ -1,0 +1,205 @@
+### Linux多进程间通信——共享内存实现
+
+又到了每周分享时刻，这周我要分享的是关于Linux中进程间通信问题，这对于底层程序的实现至关重要，进程间通信方式主要包括管程、共享内存、消息传递、套接字这几种方式，这个专题我主要介绍两种进程间通信方式，共享内存和套接字通信。为什么介绍这两种呢，因为共享内存是实现进程间通信最有效的方式，效率高，创建一块虚拟共享内存之后，所有的进程只要映射到这块内存之后就可以完成通信，但是需要做好进程间的同步与互斥。而socket套接字通信又是实现不同主机进程通信的方式，掌握了这两种通信方式，你就能够实现上位机和开发板之间的通信传输，以及实现开发板中不同进程之间的协作完成一个功能。
+
+下面正式开始我们这个专题的讲解，首先介绍使用共享内存来实现进程间通信的实现。
+
+#### 1、共享内存的实现原理
+
+共享内存顾名思义就是有一块内存是各进程可以共享的，在操作系统也被称为临界区，对临界区的访问需要进行进程间的互斥操作，不然得到的结果就不是所期望的结果。
+
+那共享内存由进程中的哪一个进程创建呢，进程中的哪一个进程都可以创建共享内存，其他进程只需要将共享内存映射到自己的地址空间中就可以访问。
+
+如果我创建了两个共享内存，两个进程间怎么来区分我访问的是同一个共享内存呢，这就需要给共享内存创建一个自己的身份ID，需要访问该共享内存的进程在映射时也带上这个ID，就可以区分访问的共享内存是哪一个了。
+
+下面我们就可以给出创建共享内存的步骤了：
+
+一、创建一个共享内存的键值，也就是给共享内存一个身份证
+
+```
+key_t shmkey = ftok(".", 0);//这里的"."就是身份证
+```
+
+二、用共享内存的键值创建共享内存
+
+```
+shmid = shmget(shmkey, 1024, 0666|IPC_CREAT);
+```
+
+这里的1024表示创建的共享内存的大小，IPC_CREAT表示的时创建共享内存。shmid表示共享内存的标识符。
+
+三、将共享内存标识符映射到本进程的地址空间中
+
+```
+addr = shmdt(shmid, 0, 0);
+```
+
+映射成功之后，我们就可以对addr访问，就相当于访问了共享内存中的数据。
+
+四、删除进程中的共享内存
+
+```
+shmdt(addr);
+```
+
+五、销毁创建的共享内存
+
+```
+shmctl(shmid, IPC_RMID, NULL);
+```
+
+上面五步就是创建共享内存的步骤，其中第五步在互相通信的任一进程中操作即可。
+
+掌握了共享内存的实现原理，下面我们就可以用共享内存来实现进程间的通信了。
+
+#### 2、进程间通信案例
+
+这里我们完成一个写进程和读进程，shmmutexWrite.c向共享内存中写入数据，shmumutexRead.c从共享内存中读取数据。
+
+我先给出shmmutexWrite.c的源代码：
+
+```
+//向共享内存写入数据
+#include <semaphore.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/types.h>
+#include <sys/ipc.h>
+#include <sys/sem.h>
+#include <sys/shm.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <string.h>
+
+#define BUFFER_SIZE 10
+#define sem_name "mysem"
+
+int main(){
+	struct People{
+		char name[10];
+		int age;
+	};
+	
+	int shmid;//定义一个共享内存标识符
+	sem_t *sem;//定义一个信号量
+	int age = 10, i = 1;
+	char buff[BUFFER_SIZE];
+	key_t shmkey;//定义一个共享内存的键值
+	shmkey = ftok("shmmutexRead.c", 0);
+	//创建共享内存和信号量的IPC
+	sem = sem_open(sem_name, O_CREAT, 0644, 1);
+	if(sem == SEM_FAILED){
+		printf("ubable to creat semaphore!\n");
+		sem_unlink(sem_name);
+		exit(-1);
+	}
+	shmid = shmget(shmkey, 1024, 0666|IPC_CREAT);
+	if(shmid == -1){
+		printf("shmget failed!\n");
+	}
+	struct People *addr;
+	//将共享内存映射到当前进程中
+	addr = (struct People*)shmat(shmid, 0, 0);
+	if(addr == (struct People*)-1){
+		printf("shmat failed\n");
+	}
+	//向共享内存写入数据
+	addr->age = 0;
+	printf("写进程映射的共享内存地址 = %p\n", addr);
+	do{
+		sem_wait(sem);//信号量初始值为1，现在减1，为0
+		memset(buff, 0, BUFFER_SIZE);
+		memset((addr+i)->name, 0, BUFFER_SIZE);
+		printf("写进程：输入一些姓名（不超过10个字符）到共享内存：\n");
+		if(fgets(buff, BUFFER_SIZE, stdin) == NULL){
+			perror("fgets\n");
+			sem_post(sem);
+			break;
+		}
+		strncpy((addr + i)->name, buff, strlen(buff) - 1);
+		(addr + i)->age = ++age;
+		addr->age++;
+		i++;
+		sem_post(sem);
+		sleep(1);
+	}while(strncmp(buff, "quit", 4) != 0);
+	if(shmdt(addr) == -1){
+		printf("shmdt if failed\n");
+	}
+	sem_close(sem);
+	sem_unlink(sem_name);
+}
+```
+
+本来shmmutexRead.c的代码想让你们自己写的，练练手，因为两个程序基本一样，下面我也直接给出吧。
+
+```
+//从共享内存中读取数据
+#include <semaphore.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/types.h>
+#include <sys/ipc.h>
+#include <sys/sem.h>
+#include <sys/shm.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <string.h>
+
+#define sem_name "mysem"
+
+int main(){
+	int shmid;
+	sem_t *sem;
+	int i = 1;
+	key_t shmkey;
+	shmkey = ftok("shmmutexRead.c", 0);
+	struct People{
+		char name[10];
+		int age;
+	};
+	
+	sem = sem_open(sem_name, 0, 0644, 0);
+	if(sem == SEM_FAILED){
+		printf("unable open semapore\n");
+		sem_close(sem);
+		exit(-1);
+	}
+	shmid = shmget(shmkey, 0, 0666);
+	if(shmid == -1){
+		printf("shmget failed\n");
+		exit(0);
+	}
+	
+	struct People* addr;
+	addr = (struct People*)shmat(shmid, 0, 0);
+	if(addr == (struct People*)-1){
+		printf("shm shmat is failed\n");
+		exit(0);
+	}
+	printf("读进程映射的共享内存地址 = %p\n", addr);
+	
+	do{
+		sem_wait(sem);
+		if(addr->age > 0){//说明共享内存已经写入数据
+			printf("读进程：绑定到共享内存 %p : 姓名 %d %s, 年龄%d \n", addr, i, (addr + i)->name, (addr+i)->age);
+			addr->age--;
+			if(strncmp((addr+i)->name, "quit", 4) == 0) break;
+			i++;
+		}
+		sem_post(sem);
+	}while(1);
+	sem_close(sem);
+	
+	if(shmdt(addr) == -1) printf("shmdt failed\n");
+	if(shmctl(shmid, IPC_RMID, NULL) == -1) printf("shmctl delete error\n");
+}
+```
+
+先运行创建共享内存的进程shmmutexWrite.c，在运行shmmutexRead.c。
+
+![18362A74-408A-41d2-A92B-1B2333494051](https://s2.loli.net/2022/05/27/A6W8ge2KTMO5wQR.png)
+
+更多嵌入式相关内容，请关注公众号河边小乌龟爬。有什么问题可以在下方留言，我看到之后会回复你。
+
+我是河边小乌龟爬，学习嵌入式软件开发路上的一名小学生，欢迎大家相互交流哇。公众号：河边小乌龟爬。
